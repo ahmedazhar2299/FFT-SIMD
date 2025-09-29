@@ -7,8 +7,6 @@ This repository provides an implementation of Fast Fourier Transform (FFT) and N
 ## Installation
 
 ```bash
-brew install imagemagick
-
 # Compile the image processing source code
 clang++ -O3 -std=c++17 fft.cpp -o fft
 
