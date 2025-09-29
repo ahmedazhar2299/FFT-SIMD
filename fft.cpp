@@ -1,219 +1,161 @@
+// fft_neon_double.cpp
 #include <arm_neon.h>
 #include <iostream>
 #include <vector>
-#include <cstdint>
+#include <complex>
+#include <cmath>
 #include <chrono>
+#include <iomanip>
+#include <algorithm>
 using namespace std;
-
-static const uint32_t MOD = 998244353u;
-static const uint32_t G   = 3u;
-static const uint32_t G_INV = 332748118u;
 
 static inline double now_seconds() {
     using namespace std::chrono;
     static const auto t0 = steady_clock::now();
     return duration<double>(steady_clock::now() - t0).count();
 }
-static inline uint32_t mod_pow(uint32_t a, uint32_t e){
-    uint64_t r = 1, x = a;
-    while (e){ if (e & 1) r = (r * x) % MOD; x = (x * x) % MOD; e >>= 1; }
-    return (uint32_t)r;
-}
-static inline uint32_t mod_inv(uint32_t a){ return mod_pow(a, MOD-2); }
 
-// --- Montgomery helpers (radix 2^32) ---
-static inline uint32_t mont_n0(uint32_t p){
-    uint64_t inv = 1;
-    for (int i=0;i<5;++i) inv *= (2 - (uint64_t)p * inv);
-    return (uint32_t)(0u - (uint32_t)inv); // n0 = -p^{-1} mod 2^32
-}
-static inline uint32_t mont_R2(uint32_t p){
-    __uint128_t R = ((__uint128_t)1 << 32) % p;
-    return (uint32_t)((R * R) % p);        // R^2 mod p
-}
-static inline uint32_t mont_scalar(uint32_t a, uint32_t b, uint32_t p, uint32_t n0){
-    uint64_t t = (uint64_t)a * b;
-    uint32_t m = (uint32_t)t * n0;
-    uint64_t s = t + (uint64_t)m * p;
-    uint32_t r = (uint32_t)(s >> 32);
-    return (r >= p) ? r - p : r;
-}
-
-static inline uint32x4_t mont4(uint32x4_t a, uint32x4_t b, uint32_t p, uint32_t n0){
-    uint32x2_t a0 = vget_low_u32(a),  a1 = vget_high_u32(a);
-    uint32x2_t b0 = vget_low_u32(b),  b1 = vget_high_u32(b);
-    uint64x2_t t0 = vmull_u32(a0, b0);
-    uint64x2_t t1 = vmull_u32(a1, b1);
-    uint32x2_t m0 = vmovn_u64(t0);
-    uint32x2_t m1 = vmovn_u64(t1);
-    uint32x2_t n0v = vdup_n_u32(n0);
-    uint64x2_t u0 = vmull_u32(m0, n0v);
-    uint64x2_t u1 = vmull_u32(m1, n0v);
-    uint32x2_t pv = vdup_n_u32(p);
-    uint64x2_t k0 = vmull_u32(vmovn_u64(u0), pv);
-    uint64x2_t k1 = vmull_u32(vmovn_u64(u1), pv);
-    uint64x2_t s0 = vaddq_u64(t0, k0);
-    uint64x2_t s1 = vaddq_u64(t1, k1);
-    uint32x2_t r0 = vshrn_n_u64(s0, 32);
-    uint32x2_t r1 = vshrn_n_u64(s1, 32);
-    uint32x4_t r  = vcombine_u32(r0, r1);
-    uint32x4_t P  = vdupq_n_u32(p);
-    uint32x4_t r_minus = vsubq_u32(r, P);
-    uint32x4_t ge = vcgeq_u32(r, P);
-    return vbslq_u32(ge, r_minus, r);
-}
-
-static inline void bit_reverse_perm(uint32_t* a, int n){
-    for (int i = 1, j = 0; i < n; ++i){
+static inline void bit_reverse_perm_soa(double* RE, double* IM, int n) {
+    for (int i = 1, j = 0; i < n; ++i) {
         int bit = n >> 1;
         for (; j & bit; bit >>= 1) j ^= bit;
         j ^= bit;
-        if (i < j) swap(a[i], a[j]);
+        if (i < j) {
+            swap(RE[i], RE[j]);
+            swap(IM[i], IM[j]);
+        }
     }
 }
 
-// --- Put data into/out of Montgomery domain ---
-static inline void to_mont(uint32_t* a, int n, uint32_t p, uint32_t n0, uint32_t R2){
-    uint32x4_t R2v = vdupq_n_u32(R2);
-    int i = 0;
-    for (; i + 4 <= n; i += 4){
-        uint32x4_t x = vld1q_u32(a + i);
-        uint32x4_t y = mont4(x, R2v, p, n0);
-        vst1q_u32(a + i, y);
-    }
-    for (; i < n; ++i) a[i] = mont_scalar(a[i], R2, p, n0);
-}
-static inline void from_mont(uint32_t* a, int n, uint32_t p, uint32_t n0){
-    int i = 0;
-    uint32x4_t ONE = vdupq_n_u32(1);
-    for (; i + 4 <= n; i += 4){
-        uint32x4_t x = vld1q_u32(a + i);
-        vst1q_u32(a + i, mont4(x, ONE, p, n0));
-    }
-    for (; i < n; ++i) a[i] = mont_scalar(a[i], 1, p, n0);
-}
-
-// --- Twiddles in Montgomery domain (corrected) ---
-static inline void build_twiddles_mont(vector<uint32_t>& Wm, int half, bool invert,
-                                       uint32_t p, uint32_t n0, uint32_t R2){
-    uint32_t step = (p - 1u) / (uint32_t)(half << 1);
-    uint32_t wlen = invert ? mod_pow(G_INV, step) : mod_pow(G, step);
-    uint32_t oneR = mont_scalar(1, R2, p, n0);       // 1 * R mod p
-    uint32_t wR   = mont_scalar(wlen, R2, p, n0);    // wlen * R mod p
-    Wm.resize(half);
-    Wm[0] = oneR;
-    for (int j = 1; j < half; ++j){
-        Wm[j] = mont_scalar(Wm[j-1], wR, p, n0);     // W[j] = W[j-1] * wR (Montgomery)
+static inline void build_twiddles(int len, bool invert, vector<double>& WR, vector<double>& WI) {
+    const int half = len >> 1;
+    WR.resize(half);
+    WI.resize(half);
+    const double ang = 2.0 * M_PI / len * (invert ? -1.0 : 1.0);
+    WR[0] = 1.0;
+    WI[0] = 0.0;
+    double c = cos(ang), s = sin(ang);
+    double wr = 1.0, wi = 0.0;
+    for (int j = 1; j < half; ++j) {
+        double tr = wr*c - wi*s;
+        double ti = wr*s + wi*c;
+        WR[j] = tr; WI[j] = ti;
+        wr = tr; wi = ti;
     }
 }
 
-static void ntt(uint32_t* a, int n, bool invert){
-    const uint32_t p  = MOD;
-    const uint32_t n0 = mont_n0(p);
-    const uint32_t R2 = mont_R2(p);
+static void fft_neon_soa(double* RE, double* IM, int n, bool invert) {
+    bit_reverse_perm_soa(RE, IM, n);
 
-    bit_reverse_perm(a, n);
+    for (int len = 2; len <= n; len <<= 1) {
+        const int half = len >> 1;
 
-    for (int len = 2; len <= n; len <<= 1){
-        int half = len >> 1;
-        vector<uint32_t> Wm; Wm.reserve(half);
-        build_twiddles_mont(Wm, half, invert, p, n0, R2);
+        vector<double> WR, WI;
+        build_twiddles(len, invert, WR, WI);
 
-        for (int i = 0; i < n; i += len){
+        for (int i = 0; i < n; i += len) {
             int j = 0;
-            for (; j + 4 <= half; j += 4){
-                uint32x4_t u = vld1q_u32(a + i + j);
-                uint32x4_t v = vld1q_u32(a + i + j + half);
-                uint32x4_t w = vld1q_u32(&Wm[j]);
-                uint32x4_t t = mont4(v, w, p, n0);
-                uint32x4_t P = vdupq_n_u32(p);
 
-                uint32x4_t x = vaddq_u32(u, t);
-                uint32x4_t xm = vsubq_u32(x, P);
-                x = vbslq_u32(vcgeq_u32(x, P), xm, x);
+            for (; j + 2 <= half; j += 2) {
+                float64x2_t wr = vld1q_f64(&WR[j]);  
+                float64x2_t wi = vld1q_f64(&WI[j]);  
 
-                uint32x4_t y = vsubq_u32(u, t);
-                uint32x4_t add = vbslq_u32(vcgtq_u32(t, u), P, vdupq_n_u32(0));
-                y = vaddq_u32(y, add);
+                float64x2_t ur = vld1q_f64(&RE[i + j]);       
+                float64x2_t ui = vld1q_f64(&IM[i + j]);       
+                float64x2_t vr = vld1q_f64(&RE[i + j + half]); 
+                float64x2_t vi = vld1q_f64(&IM[i + j + half]); 
 
-                vst1q_u32(a + i + j, x);
-                vst1q_u32(a + i + j + half, y);
+                float64x2_t tr = vsubq_f64(vmulq_f64(wr, vr), vmulq_f64(wi, vi));
+                float64x2_t ti = vaddq_f64(vmulq_f64(wr, vi), vmulq_f64(wi, vr));
+
+                float64x2_t xr = vaddq_f64(ur, tr);
+                float64x2_t xi = vaddq_f64(ui, ti);
+                float64x2_t yr = vsubq_f64(ur, tr);
+                float64x2_t yi = vsubq_f64(ui, ti);
+
+                vst1q_f64(&RE[i + j],        xr);
+                vst1q_f64(&IM[i + j],        xi);
+                vst1q_f64(&RE[i + j + half], yr);
+                vst1q_f64(&IM[i + j + half], yi);
             }
-            for (; j < half; ++j){
-                uint32_t u0 = a[i + j];
-                uint32_t t  = mont_scalar(a[i + j + half], Wm[j], p, n0);
-                uint32_t x0 = u0 + t; if (x0 >= p) x0 -= p;
-                uint32_t y0 = (u0 >= t) ? (u0 - t) : (u0 + p - t);
-                a[i + j] = x0; a[i + j + half] = y0;
+
+            for (; j < half; ++j) {
+                double ur = RE[i + j], ui = IM[i + j];
+                double vr = RE[i + j + half], vi = IM[i + j + half];
+                double wr = WR[j], wi = WI[j];
+                double tr = wr*vr - wi*vi;
+                double ti = wr*vi + wi*vr;
+                RE[i + j]         = ur + tr;
+                IM[i + j]         = ui + ti;
+                RE[i + j + half]  = ur - tr;
+                IM[i + j + half]  = ui - ti;
             }
         }
     }
 
-    if (invert){
-        const uint32_t p  = MOD;
-        const uint32_t n0 = mont_n0(p);
-        const uint32_t R2 = mont_R2(p);
-
-        uint32_t inv_n = mod_inv(n);
-        uint32_t invR  = mont_scalar(inv_n, R2, p, n0); // inv_n * R mod p
-
+    if (invert) {
+        const double invn = 1.0 / double(n);
         int i = 0;
-        uint32x4_t invv = vdupq_n_u32(invR);
-        for (; i + 4 <= n; i += 4){
-            uint32x4_t x = vld1q_u32(a + i);
-            x = mont4(x, invv, p, n0);
-            vst1q_u32(a + i, x);
+        float64x2_t s = vdupq_n_f64(invn);
+        for (; i + 2 <= n; i += 2) {
+            float64x2_t r = vld1q_f64(&RE[i]);
+            float64x2_t m = vld1q_f64(&IM[i]);
+            vst1q_f64(&RE[i], vmulq_f64(r, s));
+            vst1q_f64(&IM[i], vmulq_f64(m, s));
         }
-        for (; i < n; ++i) a[i] = mont_scalar(a[i], invR, p, n0);
-
-        from_mont(a, n, p, n0);
+        for (; i < n; ++i) {
+            RE[i] *= invn; IM[i] *= invn;
+        }
     }
 }
 
-static int convolve(uint32_t* a, uint32_t* b, int n1, int n2){
-    int need = n1 + n2 - 1, n = 1; while (n < need) n <<= 1;
-    const uint32_t p = MOD, n0 = mont_n0(p), R2 = mont_R2(p);
-    for (int i = n1; i < n; ++i) a[i] = 0;
-    for (int i = n2; i < n; ++i) b[i] = 0;
-    to_mont(a, n, p, n0, R2);
-    to_mont(b, n, p, n0, R2);
-    ntt(a, n, false); ntt(b, n, false);
-    int i = 0;
-    for (; i + 4 <= n; i += 4){
-        uint32x4_t va = vld1q_u32(a + i);
-        uint32x4_t vb = vld1q_u32(b + i);
-        vst1q_u32(a + i, mont4(va, vb, p, n0));
-    }
-    for (; i < n; ++i) a[i] = mont_scalar(a[i], b[i], p, n0);
-    ntt(a, n, true);
-    return n;
+static void fft(vector<complex<double>>& a, bool invert) {
+    const int n = (int)a.size();
+    vector<double> RE(n), IM(n);
+    for (int i = 0; i < n; ++i) { RE[i] = a[i].real(); IM[i] = a[i].imag(); }
+
+    fft_neon_soa(RE.data(), IM.data(), n, invert);
+
+    for (int i = 0; i < n; ++i) a[i] = complex<double>(RE[i], IM[i]);
 }
 
-int main(){
+static vector<long long> multiply_fft(const vector<int>& A, const vector<int>& B) {
+    int n1 = (int)A.size(), n2 = (int)B.size();
+    int n = 1; while (n < n1 + n2 - 1) n <<= 1;
+
+    vector<complex<double>> fa(n), fb(n);
+    for (int i = 0; i < n1; ++i) fa[i] = (double)A[i];
+    for (int i = 0; i < n2; ++i) fb[i] = (double)B[i];
+
+    double t0 = now_seconds();
+    fft(fa, false);
+    fft(fb, false);
+    for (int i = 0; i < n; ++i) fa[i] *= fb[i];
+    fft(fa, true);
+    double t1 = now_seconds();
+
+    vector<long long> C(n1 + n2 - 1);
+    for (int i = 0; i < (int)C.size(); ++i) C[i] = llround(fa[i].real());
+
+    cout << fixed << setprecision(6)
+         << "FFT convolution elapsed: " << (t1 - t0) << " s\n";
+    return C;
+}
+
+int main() {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
 
-    const int N = 1 << 22;                 // valid for MOD 998244353
-    const int L = 2 * N - 1;
-    int n = 1; while (n < L) n <<= 1;
+    const int N = 1 << 22; // power of two
+    vector<int> a(N, 1), b(N, 1);
 
-    vector<uint32_t> A(n), B(n);
-    const int REPEATS = 2;
-    volatile unsigned long long guard = 0;
+    auto c = multiply_fft(a, b);
 
-    double t0 = now_seconds();
-    for (int rep=0; rep<REPEATS; ++rep){
-        fill(A.begin(), A.end(), 0);
-        fill(B.begin(), B.end(), 0);
-        for (int i = 0; i < N; ++i) A[i] = B[i] = 1;
-        convolve(A.data(), B.data(), N, N);
-        unsigned long long s = 0;
-        s += A[0]; s += A[1]; s += A[N-1]; s += A[N]; s += A[L-1];
-        guard += s;
+    cout << "c[0..4]: ";
+    for (int i = 0; i < 5 && i < (int)c.size(); ++i) cout << c[i] << (i+1<5?" ":"\n");
+
+    if ((int)c.size() > N) {
+        cout << "c[N-2], c[N-1], c[N]: " << c[N-2] << " " << c[N-1] << " " << c[N] << "\n";
     }
-    double t1 = now_seconds();
-
-    cout << "checksum: " << guard << "\n";
-    cout << "Time elapsed: " << (t1 - t0) << " s\n";
     return 0;
 }
